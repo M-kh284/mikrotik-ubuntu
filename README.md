@@ -1,56 +1,61 @@
-# نصب MikroTik CHR روی Ubuntu
+# نصب مستقیم MikroTik CHR روی سرور (جایگزین Ubuntu)
 
-این مخزن شامل یک اسکریپت آماده برای نصب و ساخت ماشین مجازی MikroTik CHR روی سرور Ubuntu است.
+این پروژه یک اسکریپت برای **نصب مستقیم MikroTik CHR روی دیسک سرور** ارائه می‌دهد.
+در این روش Ubuntu از روی دیسک پاک می‌شود و RouterOS (CHR image) جایگزین آن می‌گردد.
+
+## ⚠️ هشدار خیلی مهم
+
+این اسکریپت دیسک مقصد را overwrite می‌کند و **همه اطلاعات آن را حذف می‌کند**.
+قبل از اجرا حتماً بکاپ تهیه کنید.
 
 ## فایل‌ها
 
-- `install-mikrotik-chr.sh`: اسکریپت اصلی نصب
+- `install-mikrotik-chr.sh`: اسکریپت نصب مستقیم روی دیسک
 
 ## پیش‌نیازها
 
-- Ubuntu Server (ترجیحاً 22.04 یا جدیدتر)
+- اجرای اسکریپت در محیط Ubuntu (ترجیحاً Live/Rescue)
 - دسترسی `root` یا `sudo`
-- فعال بودن virtualization (VT-x/AMD-V)
-- داشتن Linux bridge (مثل `br0`) روی سرور
+- اینترنت برای دانلود ایمیج CHR
+- دانستن نام دقیق دیسک مقصد (مثل `/dev/sda` یا `/dev/nvme0n1`)
 
 ## استفاده سریع
 
 ```bash
-sudo ./install-mikrotik-chr.sh --bridge br0
+sudo ./install-mikrotik-chr.sh --target-disk /dev/sda
 ```
 
-## نمونه با تنظیمات سفارشی
+## مثال با نسخه مشخص و ریبوت خودکار
 
 ```bash
 sudo ./install-mikrotik-chr.sh \
-  --bridge br0 \
-  --vm-name chr-office \
-  --ram 1024 \
-  --vcpus 2 \
-  --disk-size 4 \
-  --chr-version 7.16.2
+  --target-disk /dev/sda \
+  --chr-version 7.16.2 \
+  --reboot
 ```
 
 ## پارامترها
 
-- `--bridge`: نام bridge (اجباری)
-- `--vm-name`: نام VM (پیش‌فرض: `mikrotik-chr`)
-- `--ram`: مقدار RAM به MB (پیش‌فرض: `512`)
-- `--vcpus`: تعداد CPU (پیش‌فرض: `1`)
-- `--disk-size`: اندازه دیسک به GB (پیش‌فرض: `2`)
+- `--target-disk`: دیسک مقصد (اجباری)
 - `--chr-version`: نسخه CHR (پیش‌فرض: `7.16.2`)
-- `--workdir`: مسیر فایل‌های image (پیش‌فرض: `/var/lib/libvirt/images`)
-- `--no-autostart`: غیرفعال کردن autostart VM
+- `--temp-dir`: مسیر موقت برای دانلود/اکسترکت فایل‌ها (پیش‌فرض: `/tmp/mikrotik-install`)
+- `--force`: حذف تاییدیه تعاملی (فقط برای automation)
+- `--reboot`: ریبوت خودکار بعد از نصب موفق
 
-## نکته
+## روند کار اسکریپت
 
-بعد از ساخته شدن VM برای اتصال کنسول:
+1. بررسی root بودن اجرا
+2. بررسی معتبر بودن دیسک مقصد
+3. گرفتن تاییدیه برای پاک شدن کامل دیسک
+4. نصب وابستگی‌ها (`curl`, `unzip`, ...)
+5. دانلود ایمیج CHR از سایت رسمی MikroTik
+6. پاک کردن signatureهای قدیمی دیسک
+7. نوشتن مستقیم ایمیج روی دیسک با `dd`
+8. نمایش پیام نهایی و ریبوت (در صورت انتخاب)
 
-```bash
-virsh console mikrotik-chr
-```
-
-ورود اولیه MikroTik:
+## اطلاعات ورود اولیه MikroTik
 
 - user: `admin`
 - password: خالی
+
+بعد از اولین ورود حتماً پسورد ادمین را تغییر دهید.

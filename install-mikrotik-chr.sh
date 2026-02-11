@@ -1,36 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# MikroTik CHR installer for Ubuntu servers.
-# This script installs virtualization dependencies, downloads a CHR image,
-# converts it to qcow2 and creates a VM with virt-install.
+# Bare-metal MikroTik CHR installer for Ubuntu live/rescue environments.
+# WARNING: This script will overwrite the target disk and remove Ubuntu.
 
-VM_NAME="mikrotik-chr"
-RAM_MB=512
-VCPUS=1
-DISK_SIZE_GB=2
-BRIDGE_IFACE=""
 CHR_VERSION="7.16.2"
-WORKDIR="/var/lib/libvirt/images"
-AUTO_START=true
+TARGET_DISK=""
+TEMP_DIR="/tmp/mikrotik-install"
+FORCE=false
+REBOOT_AFTER_INSTALL=false
 
 usage() {
   cat <<USAGE
-Usage: sudo $0 [options]
+Usage: sudo $0 --target-disk /dev/sdX [options]
+
+This script installs MikroTik CHR directly on a server disk.
+Ubuntu and all data on the target disk will be destroyed.
+
+Required:
+  --target-disk DISK      Target block device (example: /dev/sda, /dev/nvme0n1)
 
 Options:
-  --vm-name NAME          Virtual machine name (default: ${VM_NAME})
-  --ram MB                RAM in MB (default: ${RAM_MB})
-  --vcpus N               Number of vCPUs (default: ${VCPUS})
-  --disk-size GB          VM disk size in GB after conversion (default: ${DISK_SIZE_GB})
-  --bridge IFACE          Linux bridge interface name (required for bridged networking)
   --chr-version VERSION   MikroTik CHR version (default: ${CHR_VERSION})
-  --workdir PATH          Working directory for image files (default: ${WORKDIR})
-  --no-autostart          Do not enable VM autostart
+  --temp-dir PATH         Temporary working directory (default: ${TEMP_DIR})
+  --force                 Skip final interactive confirmation
+  --reboot                Reboot automatically after successful install
   -h, --help              Show this help
 
 Example:
-  sudo $0 --bridge br0 --vm-name chr-office --ram 1024 --vcpus 2
+  sudo $0 --target-disk /dev/sda --chr-version 7.16.2 --reboot
 USAGE
 }
 
@@ -44,22 +42,16 @@ require_root() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --vm-name)
-        VM_NAME="$2"; shift 2 ;;
-      --ram)
-        RAM_MB="$2"; shift 2 ;;
-      --vcpus)
-        VCPUS="$2"; shift 2 ;;
-      --disk-size)
-        DISK_SIZE_GB="$2"; shift 2 ;;
-      --bridge)
-        BRIDGE_IFACE="$2"; shift 2 ;;
+      --target-disk)
+        TARGET_DISK="$2"; shift 2 ;;
       --chr-version)
         CHR_VERSION="$2"; shift 2 ;;
-      --workdir)
-        WORKDIR="$2"; shift 2 ;;
-      --no-autostart)
-        AUTO_START=false; shift ;;
+      --temp-dir)
+        TEMP_DIR="$2"; shift 2 ;;
+      --force)
+        FORCE=true; shift ;;
+      --reboot)
+        REBOOT_AFTER_INSTALL=true; shift ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -72,107 +64,121 @@ parse_args() {
 }
 
 validate_inputs() {
-  if [[ -z "${BRIDGE_IFACE}" ]]; then
-    echo "[ERROR] --bridge is required. Example: --bridge br0" >&2
+  if [[ -z "${TARGET_DISK}" ]]; then
+    echo "[ERROR] --target-disk is required." >&2
+    usage
     exit 1
   fi
 
-  if ! ip link show "${BRIDGE_IFACE}" >/dev/null 2>&1; then
-    echo "[ERROR] Bridge interface '${BRIDGE_IFACE}' was not found." >&2
+  if [[ ! -b "${TARGET_DISK}" ]]; then
+    echo "[ERROR] Target '${TARGET_DISK}' is not a valid block device." >&2
     exit 1
   fi
 
-  if ! [[ "${RAM_MB}" =~ ^[0-9]+$ && "${RAM_MB}" -ge 256 ]]; then
-    echo "[ERROR] --ram must be a number >= 256." >&2
+  if mount | grep -q "^${TARGET_DISK}"; then
+    echo "[ERROR] Target disk '${TARGET_DISK}' appears to be mounted. Unmount it first." >&2
     exit 1
   fi
 
-  if ! [[ "${VCPUS}" =~ ^[0-9]+$ && "${VCPUS}" -ge 1 ]]; then
-    echo "[ERROR] --vcpus must be a number >= 1." >&2
-    exit 1
+  # Ensure none of the target partitions are mounted
+  while IFS= read -r part; do
+    if mount | awk '{print $1}' | grep -qx "${part}"; then
+      echo "[ERROR] Partition '${part}' is mounted. Unmount all partitions of ${TARGET_DISK} first." >&2
+      exit 1
+    fi
+  done < <(lsblk -ln -o NAME "${TARGET_DISK}" | tail -n +2 | sed 's#^#/dev/#')
+}
+
+confirm_destruction() {
+  echo
+  echo "[WARNING] You are about to install MikroTik CHR on: ${TARGET_DISK}"
+  lsblk "${TARGET_DISK}" || true
+  echo "[WARNING] ALL DATA on ${TARGET_DISK} will be permanently deleted."
+
+  if [[ "${FORCE}" == "true" ]]; then
+    echo "[INFO] --force supplied, skipping interactive confirmation."
+    return
   fi
 
-  if ! [[ "${DISK_SIZE_GB}" =~ ^[0-9]+$ && "${DISK_SIZE_GB}" -ge 1 ]]; then
-    echo "[ERROR] --disk-size must be a number >= 1." >&2
+  read -r -p "Type 'ERASE' to continue: " answer
+  if [[ "${answer}" != "ERASE" ]]; then
+    echo "[INFO] Installation canceled by user."
     exit 1
   fi
 }
 
 install_dependencies() {
-  echo "[INFO] Installing dependencies..."
+  echo "[INFO] Installing required tools..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients virtinst bridge-utils curl unzip
-  systemctl enable --now libvirtd
+  apt-get install -y curl unzip coreutils util-linux
 }
 
-download_chr_image() {
+download_and_extract_chr() {
   local zip_url="https://download.mikrotik.com/routeros/${CHR_VERSION}/chr-${CHR_VERSION}.img.zip"
-  local zip_path="${WORKDIR}/chr-${CHR_VERSION}.img.zip"
-  local raw_img="${WORKDIR}/chr-${CHR_VERSION}.img"
-  local qcow2_img="${WORKDIR}/${VM_NAME}.qcow2"
+  local zip_path="${TEMP_DIR}/chr-${CHR_VERSION}.img.zip"
+  local img_path="${TEMP_DIR}/chr-${CHR_VERSION}.img"
 
-  mkdir -p "${WORKDIR}"
+  mkdir -p "${TEMP_DIR}"
 
   echo "[INFO] Downloading CHR image: ${zip_url}"
   curl -fL "${zip_url}" -o "${zip_path}"
 
-  echo "[INFO] Extracting image..."
-  unzip -o "${zip_path}" -d "${WORKDIR}"
+  echo "[INFO] Extracting CHR image..."
+  unzip -o "${zip_path}" -d "${TEMP_DIR}"
 
-  if [[ ! -f "${raw_img}" ]]; then
-    echo "[ERROR] Expected image '${raw_img}' not found after unzip." >&2
-    exit 1
-  fi
-
-  echo "[INFO] Converting image to qcow2: ${qcow2_img}"
-  qemu-img convert -f raw -O qcow2 "${raw_img}" "${qcow2_img}"
-
-  echo "[INFO] Resizing disk to ${DISK_SIZE_GB}G"
-  qemu-img resize "${qcow2_img}" "${DISK_SIZE_GB}G"
-
-  rm -f "${zip_path}" "${raw_img}"
-}
-
-ensure_vm_not_exists() {
-  if virsh dominfo "${VM_NAME}" >/dev/null 2>&1; then
-    echo "[ERROR] VM '${VM_NAME}' already exists. Use another --vm-name or remove old VM first." >&2
+  if [[ ! -f "${img_path}" ]]; then
+    echo "[ERROR] Expected image '${img_path}' not found after extraction." >&2
     exit 1
   fi
 }
 
-create_vm() {
-  local qcow2_img="${WORKDIR}/${VM_NAME}.qcow2"
+wipe_signatures() {
+  echo "[INFO] Removing old filesystem signatures from ${TARGET_DISK}..."
+  wipefs -a "${TARGET_DISK}"
+}
 
-  echo "[INFO] Creating VM '${VM_NAME}'..."
-  virt-install \
-    --name "${VM_NAME}" \
-    --memory "${RAM_MB}" \
-    --vcpus "${VCPUS}" \
-    --cpu host \
-    --import \
-    --disk "path=${qcow2_img},format=qcow2,bus=virtio" \
-    --network "bridge=${BRIDGE_IFACE},model=virtio" \
-    --graphics none \
-    --noautoconsole
+write_image_to_disk() {
+  local img_path="${TEMP_DIR}/chr-${CHR_VERSION}.img"
 
-  if [[ "${AUTO_START}" == "true" ]]; then
-    virsh autostart "${VM_NAME}"
+  echo "[INFO] Writing CHR image to ${TARGET_DISK} (this may take a few minutes)..."
+  dd if="${img_path}" of="${TARGET_DISK}" bs=4M conv=fsync status=progress
+  sync
+
+  echo "[INFO] Installation image written successfully."
+}
+
+cleanup() {
+  echo "[INFO] Cleaning temporary files..."
+  rm -rf "${TEMP_DIR}"
+}
+
+show_next_steps() {
+  echo
+  echo "[DONE] MikroTik CHR was installed on ${TARGET_DISK}."
+  echo "[DONE] Remove Ubuntu boot media/rescue ISO before reboot."
+  echo "[DONE] Default login: user=admin password=(empty)"
+
+  if [[ "${REBOOT_AFTER_INSTALL}" == "true" ]]; then
+    echo "[INFO] Rebooting system in 5 seconds..."
+    sleep 5
+    reboot
+  else
+    echo "[INFO] Reboot manually when ready."
   fi
-
-  echo "[INFO] VM '${VM_NAME}' created successfully."
-  echo "[INFO] First login -> user: admin, password: (empty)"
-  echo "[INFO] Use this command to open serial console: virsh console ${VM_NAME}"
 }
 
 main() {
   require_root
   parse_args "$@"
   validate_inputs
+  confirm_destruction
   install_dependencies
-  ensure_vm_not_exists
-  download_chr_image
-  create_vm
+  download_and_extract_chr
+  wipe_signatures
+  write_image_to_disk
+  cleanup
+  show_next_steps
 }
 
 main "$@"
